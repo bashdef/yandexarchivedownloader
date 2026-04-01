@@ -2,10 +2,7 @@
 
 importScripts("../lib/fflate.min.js", "../lib/pdf-lib.min.js");
 
-const STATE = {
-  running: false,
-  cancelled: false
-};
+const STATE = { running: false, cancelled: false };
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === "START_EXPORT") {
@@ -14,13 +11,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       .catch((error) => sendResponse({ ok: false, error: error.message }));
     return true;
   }
-
   if (message?.type === "STOP_EXPORT") {
     STATE.cancelled = true;
     sendResponse({ ok: true });
     return false;
   }
-
   return false;
 });
 
@@ -35,75 +30,53 @@ async function runExport(format) {
 
   try {
     const tab = await getActiveTab();
-    if (!tab?.id) {
+    if (!tab?.id || !tab.url) {
       throw new Error("Не удалось определить активную вкладку.");
     }
-
-    const collectResponse = await chrome.tabs.sendMessage(tab.id, { type: "COLLECT_PAGES" });
-    if (!collectResponse?.ok) {
-      throw new Error(collectResponse?.error || "Не удалось собрать страницы.");
+    if (!/^https:\/\/yandex\.ru\/archive\/catalog\//.test(tab.url)) {
+      throw new Error("Откройте страницу документа Яндекс.Архив.");
     }
 
-    const pages = collectResponse.pages || [];
-    if (!pages.length) {
-      throw new Error("Страницы не найдены. Откройте документ Яндекс.Архив и попробуйте снова.");
-    }
+    const meta = await readDocumentMeta(tab.id, tab.url);
+    await setProgress({ phase: "Загрузка страниц", current: 0, total: meta.totalPages, done: false });
 
-    await setProgress({ phase: "Загрузка страниц", current: 0, total: pages.length, done: false });
-    const items = await downloadPages(pages);
+    const items = [];
+    for (let page = 1; page <= meta.totalPages; page += 1) {
+      if (STATE.cancelled) {
+        throw new Error("Экспорт остановлен пользователем.");
+      }
+
+      const pageUrl = `${meta.baseUrl}/${page}`;
+      await chrome.tabs.update(tab.id, { url: pageUrl });
+      await waitForTabLoad(tab.id);
+
+      const shot = await captureCanvas(tab.id);
+      items.push({
+        name: `${String(page).padStart(4, "0")}.png`,
+        ext: "png",
+        buffer: dataUrlToArrayBuffer(shot.dataUrl)
+      });
+
+      await setProgress({
+        phase: "Загрузка страниц",
+        current: page,
+        total: meta.totalPages,
+        done: false
+      });
+    }
 
     await setProgress({ phase: "Сборка файла", current: items.length, total: items.length, done: false });
     if (format === "zip") {
-      await saveZip(items, collectResponse.documentId);
+      await saveZip(items, meta.documentId);
     } else {
-      await savePdf(items, collectResponse.documentId);
+      await savePdf(items, meta.documentId);
     }
 
-    await setProgress({
-      phase: "Готово",
-      current: items.length,
-      total: items.length,
-      done: true
-    });
+    await setProgress({ phase: "Готово", current: items.length, total: items.length, done: true });
   } finally {
     STATE.running = false;
     STATE.cancelled = false;
   }
-}
-
-async function downloadPages(pages) {
-  const files = [];
-
-  for (let i = 0; i < pages.length; i += 1) {
-    if (STATE.cancelled) {
-      throw new Error("Экспорт остановлен пользователем.");
-    }
-
-    const page = pages[i];
-    const response = await fetch(page.url, { credentials: "include" });
-    if (!response.ok) {
-      throw new Error(`Ошибка загрузки страницы ${page.index}: ${response.status}`);
-    }
-
-    const contentType = (response.headers.get("content-type") || "").toLowerCase();
-    const ext = contentType.includes("png") ? "png" : "jpg";
-    const buffer = await response.arrayBuffer();
-
-    files.push({
-      name: `${String(page.index).padStart(4, "0")}.${ext}`,
-      ext,
-      buffer
-    });
-
-    await setProgress({
-      phase: "Загрузка страниц",
-      current: i + 1,
-      total: pages.length,
-      done: false
-    });
-  }
-
-  return files;
 }
 
 async function saveZip(items, documentId) {
@@ -157,4 +130,87 @@ async function getActiveTab() {
 
 async function setProgress(progress) {
   await chrome.storage.session.set({ exportProgress: progress });
+}
+
+async function readDocumentMeta(tabId, tabUrl) {
+  const result = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: () => {
+      const pageBlock = document.querySelector(".Pagination-Pages");
+      const text = pageBlock?.textContent || "";
+      const numbers = text.match(/\d+/g) || [];
+      const total = Number(numbers[numbers.length - 1] || 0);
+
+      const pathMatch = location.pathname.match(/\/archive\/catalog\/([^/]+)\/(\d+)/);
+      const documentId = pathMatch?.[1] || "archive-document";
+      const baseUrl = `${location.origin}/archive/catalog/${documentId}`;
+      return { totalPages: total, documentId, baseUrl };
+    }
+  });
+
+  const meta = result?.[0]?.result;
+  if (!meta?.totalPages || meta.totalPages < 1) {
+    throw new Error("Не удалось определить количество страниц в .Pagination-Pages.");
+  }
+  if (!meta?.baseUrl) {
+    const fallbackBase = tabUrl.replace(/\/\d+([?#].*)?$/, "");
+    return { ...meta, baseUrl: fallbackBase };
+  }
+  return meta;
+}
+
+async function captureCanvas(tabId) {
+  const result = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: async () => {
+      const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+      for (let i = 0; i < 30; i += 1) {
+        const canvas = document.querySelector(".konvajs-content canvas");
+        if (canvas && canvas.width > 0 && canvas.height > 0) {
+          const dataUrl = canvas.toDataURL("image/png");
+          if (dataUrl && dataUrl.startsWith("data:image/png;base64,")) {
+            return { dataUrl };
+          }
+        }
+        await wait(250);
+      }
+      throw new Error("Не найден canvas в .konvajs-content.");
+    }
+  });
+
+  const shot = result?.[0]?.result;
+  if (!shot?.dataUrl) {
+    throw new Error("Не удалось получить изображение страницы.");
+  }
+  return shot;
+}
+
+function dataUrlToArrayBuffer(dataUrl) {
+  const base64 = dataUrl.split(",")[1] || "";
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes.buffer;
+}
+
+function waitForTabLoad(tabId) {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      chrome.tabs.onUpdated.removeListener(listener);
+      reject(new Error("Таймаут загрузки страницы."));
+    }, 30000);
+
+    function listener(updatedTabId, info) {
+      if (updatedTabId !== tabId || info.status !== "complete") {
+        return;
+      }
+      clearTimeout(timeout);
+      chrome.tabs.onUpdated.removeListener(listener);
+      resolve();
+    }
+
+    chrome.tabs.onUpdated.addListener(listener);
+  });
 }

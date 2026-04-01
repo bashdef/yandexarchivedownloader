@@ -3,7 +3,7 @@
   "name": "Yandex Archiver Downloader",
   "version": "0.1.0",
   "description": "Скачивает страницы документа Яндекс.Архив в ZIP или PDF.",
-  "permissions": ["activeTab", "downloads", "storage", "tabs"],
+  "permissions": ["activeTab", "downloads", "storage", "tabs", "scripting"],
   "host_permissions": ["https://yandex.ru/*"],
   "background": {
     "service_worker": "src/background.js"
@@ -12,13 +12,6 @@
     "default_title": "Yandex Archiver Downloader",
     "default_popup": "src/popup.html"
   },
-  "content_scripts": [
-    {
-      "matches": ["https://yandex.ru/archive/catalog/*"],
-      "js": ["src/content.js"],
-      "run_at": "document_idle"
-    }
-  ],
   "web_accessible_resources": [
     {
       "resources": ["lib/fflate.min.js", "lib/pdf-lib.min.js"],
