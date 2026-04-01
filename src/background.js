@@ -66,10 +66,11 @@ async function runExport(format) {
     }
 
     await setProgress({ phase: "Сборка файла", current: items.length, total: items.length, done: false });
+    const fileBaseName = sanitizeFileName(meta.title || meta.documentId || "archive-document");
     if (format === "zip") {
-      await saveZip(items, meta.documentId);
+      await saveZip(items, fileBaseName);
     } else {
-      await savePdf(items, meta.documentId);
+      await savePdf(items, fileBaseName);
     }
 
     await setProgress({ phase: "Готово", current: items.length, total: items.length, done: true });
@@ -79,7 +80,7 @@ async function runExport(format) {
   }
 }
 
-async function saveZip(items, documentId) {
+async function saveZip(items, fileBaseName) {
   const zipInput = {};
   for (const item of items) {
     zipInput[item.name] = new Uint8Array(item.buffer);
@@ -90,13 +91,13 @@ async function saveZip(items, documentId) {
 
   await chrome.downloads.download({
     url,
-    filename: `${documentId || "archive-document"}.zip`,
+    filename: `${fileBaseName || "archive-document"}.zip`,
     saveAs: true
   });
 
 }
 
-async function savePdf(items, documentId) {
+async function savePdf(items, fileBaseName) {
   const { PDFDocument } = PDFLib;
   const pdfDoc = await PDFDocument.create();
 
@@ -113,7 +114,7 @@ async function savePdf(items, documentId) {
 
   await chrome.downloads.download({
     url,
-    filename: `${documentId || "archive-document"}.pdf`,
+    filename: `${fileBaseName || "archive-document"}.pdf`,
     saveAs: true
   });
 
@@ -140,7 +141,8 @@ async function readDocumentMeta(tabId, tabUrl) {
       const pathMatch = location.pathname.match(/\/archive\/catalog\/([^/]+)\/(\d+)/);
       const documentId = pathMatch?.[1] || "archive-document";
       const baseUrl = `${location.origin}/archive/catalog/${documentId}`;
-      return { totalPages: total, documentId, baseUrl };
+      const title = (document.querySelector("h1")?.textContent || "").trim();
+      return { totalPages: total, documentId, baseUrl, title };
     }
   });
 
@@ -199,6 +201,14 @@ function bytesToDataUrl(bytes, mimeType) {
     binary += String.fromCharCode(...chunk);
   }
   return `data:${mimeType};base64,${btoa(binary)}`;
+}
+
+function sanitizeFileName(value) {
+  const cleaned = String(value || "")
+    .replace(/[<>:"/\\|?*\u0000-\u001F]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return cleaned || "archive-document";
 }
 
 function waitForTabLoad(tabId) {
