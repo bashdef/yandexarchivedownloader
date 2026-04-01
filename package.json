@@ -1,0 +1,25 @@
+{
+  "name": "yandexarchiver",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bashdef/yandexarchivedownloader.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/bashdef/yandexarchivedownloader/issues"
+  },
+  "homepage": "https://github.com/bashdef/yandexarchivedownloader#readme",
+  "dependencies": {
+    "fflate": "^0.8.2",
+    "pdf-lib": "^1.17.1"
+  }
+}
