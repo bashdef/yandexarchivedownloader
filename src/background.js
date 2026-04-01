@@ -86,8 +86,7 @@ async function saveZip(items, documentId) {
   }
 
   const zipped = fflate.zipSync(zipInput, { level: 0 });
-  const blob = new Blob([zipped], { type: "application/zip" });
-  const url = URL.createObjectURL(blob);
+  const url = bytesToDataUrl(zipped, "application/zip");
 
   await chrome.downloads.download({
     url,
@@ -95,7 +94,6 @@ async function saveZip(items, documentId) {
     saveAs: true
   });
 
-  URL.revokeObjectURL(url);
 }
 
 async function savePdf(items, documentId) {
@@ -111,8 +109,7 @@ async function savePdf(items, documentId) {
   }
 
   const pdfBytes = await pdfDoc.save();
-  const blob = new Blob([pdfBytes], { type: "application/pdf" });
-  const url = URL.createObjectURL(blob);
+  const url = bytesToDataUrl(pdfBytes, "application/pdf");
 
   await chrome.downloads.download({
     url,
@@ -120,7 +117,6 @@ async function savePdf(items, documentId) {
     saveAs: true
   });
 
-  URL.revokeObjectURL(url);
 }
 
 async function getActiveTab() {
@@ -193,6 +189,16 @@ function dataUrlToArrayBuffer(dataUrl) {
     bytes[i] = binary.charCodeAt(i);
   }
   return bytes.buffer;
+}
+
+function bytesToDataUrl(bytes, mimeType) {
+  const chunkSize = 0x8000;
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    const chunk = bytes.subarray(i, i + chunkSize);
+    binary += String.fromCharCode(...chunk);
+  }
+  return `data:${mimeType};base64,${btoa(binary)}`;
 }
 
 function waitForTabLoad(tabId) {
