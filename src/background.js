@@ -50,6 +50,11 @@ async function runExport(format) {
       await chrome.tabs.update(tab.id, { url: pageUrl });
       await waitForTabLoad(tab.id, pageUrl);
 
+      const expectedPath = pathnameOnly(pageUrl);
+      if (!(await isArchivePageOk(tab.id, expectedPath))) {
+        break;
+      }
+
       const shot = await waitForStableCanvas(tab.id);
       if (shot.cancelled) {
         break;
@@ -159,9 +164,50 @@ async function readDocumentMeta(tabId, tabUrl) {
     target: { tabId },
     func: () => {
       const pageBlock = document.querySelector(".Pagination-Pages");
-      const text = pageBlock?.textContent || "";
-      const numbers = text.match(/\d+/g) || [];
-      const total = Number(numbers[numbers.length - 1] || 0);
+      const blockText = pageBlock?.textContent || "";
+
+      let total = 0;
+      const slashMatch = blockText.match(/(\d+)\s*\/\s*(\d+)/);
+
+      let maxFromLinks = 0;
+      if (pageBlock) {
+        const anchors = pageBlock.querySelectorAll("a[href]");
+        for (const a of anchors) {
+          const href = a.getAttribute("href") || "";
+          const m = href.match(/\/archive\/catalog\/[^/]+\/(\d+)/);
+          if (m) {
+            const n = Number(m[1]);
+            if (Number.isFinite(n)) {
+              maxFromLinks = Math.max(maxFromLinks, n);
+            }
+          }
+        }
+        for (const node of pageBlock.querySelectorAll("button, [role='button'], span, div")) {
+          const onlyDigits = (node.textContent || "").trim();
+          if (/^\d+$/.test(onlyDigits)) {
+            const n = Number(onlyDigits);
+            if (Number.isFinite(n)) {
+              maxFromLinks = Math.max(maxFromLinks, n);
+            }
+          }
+        }
+      }
+
+      if (slashMatch) {
+        total = Number(slashMatch[2]);
+      } else {
+        const numbers = blockText.match(/\d+/g) || [];
+        const lastNum = Number(numbers[numbers.length - 1] || 0);
+        if (maxFromLinks > 0 && lastNum > maxFromLinks) {
+          total = maxFromLinks;
+        } else {
+          total = lastNum;
+        }
+      }
+
+      if (!Number.isFinite(total) || total < 1) {
+        total = maxFromLinks;
+      }
 
       const pathMatch = location.pathname.match(/\/archive\/catalog\/([^/]+)\/(\d+)/);
       const documentId = pathMatch?.[1] || "archive-document";
@@ -336,4 +382,48 @@ function waitForTabLoad(tabId, expectedPageUrl) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function pathnameOnly(url) {
+  try {
+    return new URL(url).pathname;
+  } catch {
+    return "";
+  }
+}
+
+async function isArchivePageOk(tabId, expectedPath) {
+  const results = await chrome.scripting.executeScript({
+    target: { tabId },
+    args: [expectedPath],
+    func: (expected) => {
+      let pathMatch = !expected;
+      try {
+        pathMatch = location.pathname === expected;
+      } catch {
+        pathMatch = false;
+      }
+      const path = (location.pathname || "").toLowerCase();
+      if (path.includes("/error") || path.includes("/errors/")) {
+        return false;
+      }
+
+      const title = (document.title || "").toLowerCase();
+      const h1 = (document.querySelector("h1")?.textContent || "").toLowerCase();
+      const sample = ((document.body?.innerText || "") + title + h1).slice(0, 1200).toLowerCase();
+      const looks404 =
+        /\b404\b/.test(title) ||
+        sample.includes("страница не найдена") ||
+        sample.includes("страница не существует") ||
+        sample.includes("ничего не нашлось") ||
+        (sample.includes("не найден") && sample.includes("страниц"));
+
+      if (looks404 || !pathMatch) {
+        return false;
+      }
+      return true;
+    }
+  });
+
+  return results?.[0]?.result === true;
 }
