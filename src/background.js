@@ -4,6 +4,11 @@ importScripts("../lib/fflate.min.js", "../lib/pdf-lib.min.js");
 
 const STATE = { running: false, cancelled: false };
 
+/** Больше pixelRatio = больше пикселей в PNG/PDF и чётче при зуме в просмотрщике (файлы тяжелее). */
+const EXPORT_PIXEL_RATIO = 2;
+/** Если Konva недоступен — временно увеличить масштаб вкладки, чтобы канвас отрисовался крупнее. */
+const TAB_ZOOM_BOOST = 1.75;
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === "START_EXPORT") {
     runExport(message.format)
@@ -55,7 +60,7 @@ async function runExport(format) {
         break;
       }
 
-      const shot = await waitForStableCanvas(tab.id);
+      const shot = await captureArchivePageImage(tab.id);
       if (shot.cancelled) {
         break;
       }
@@ -228,6 +233,115 @@ async function readDocumentMeta(tabId, tabUrl) {
   return meta;
 }
 
+async function captureArchivePageImage(tabId) {
+  const stable = await waitForStableCanvas(tabId);
+  if (stable.cancelled) {
+    return { cancelled: true };
+  }
+
+  let dataUrl = await exportKonvaOrCanvasSnapshot(tabId, EXPORT_PIXEL_RATIO);
+  if (!dataUrl) {
+    const boosted = await exportWithBrowserZoomBoost(tabId);
+    if (boosted?.cancelled) {
+      return { cancelled: true };
+    }
+    dataUrl = boosted;
+  }
+
+  if (!dataUrl || !dataUrl.startsWith("data:image/png;base64,")) {
+    throw new Error("Не удалось получить изображение страницы (.konvajs-content).");
+  }
+
+  return { dataUrl };
+}
+
+async function exportWithBrowserZoomBoost(tabId) {
+  let prevZoom = 1;
+  try {
+    prevZoom = await chrome.tabs.getZoom(tabId);
+  } catch {
+    return null;
+  }
+
+  try {
+    await chrome.tabs.setZoom(tabId, TAB_ZOOM_BOOST);
+    await sleep(800);
+    const stableAgain = await waitForStableCanvas(tabId);
+    if (stableAgain.cancelled) {
+      await chrome.tabs.setZoom(tabId, prevZoom);
+      return { cancelled: true };
+    }
+  } catch {
+    try {
+      await chrome.tabs.setZoom(tabId, prevZoom);
+    } catch {
+      /* ignore */
+    }
+    return null;
+  }
+
+  let dataUrl = await exportKonvaOrCanvasSnapshot(tabId, 1);
+  try {
+    await chrome.tabs.setZoom(tabId, prevZoom);
+  } catch {
+    /* ignore */
+  }
+
+  return dataUrl;
+}
+
+async function exportKonvaOrCanvasSnapshot(tabId, pixelRatio) {
+  const results = await chrome.scripting.executeScript({
+    target: { tabId },
+    world: "MAIN",
+    args: [pixelRatio],
+    func: (pr) => {
+      const root = document.querySelector(".konvajs-content");
+      if (!root) {
+        return null;
+      }
+
+      const KonvaGlobal = typeof Konva !== "undefined" ? Konva : window.Konva;
+      const stages =
+        KonvaGlobal &&
+        (KonvaGlobal.stages ||
+          (Array.isArray(KonvaGlobal.Stages) ? KonvaGlobal.Stages : null));
+
+      if (stages && stages.length) {
+        for (const stage of stages) {
+          try {
+            const container = stage.container && stage.container();
+            if (container && root.contains(container)) {
+              const url =
+                typeof stage.toDataURL === "function"
+                  ? stage.toDataURL({ mimeType: "image/png", pixelRatio: pr })
+                  : null;
+              if (url && url.startsWith("data:image/png")) {
+                return url;
+              }
+            }
+          } catch {
+            /* next stage */
+          }
+        }
+      }
+
+      try {
+        const canvas = root.querySelector("canvas");
+        if (!canvas || canvas.width < 64 || canvas.height < 64) {
+          return null;
+        }
+        return canvas.toDataURL("image/png");
+      } catch {
+        return null;
+      }
+    }
+  });
+
+  const url = results?.[0]?.result;
+  return typeof url === "string" ? url : null;
+}
+
 async function waitForStableCanvas(tabId) {
   const maxMs = 120000;
   const stableNeeded = 3;
@@ -255,22 +369,13 @@ async function waitForStableCanvas(tabId) {
         if (!canvas || canvas.width < 64 || canvas.height < 64) {
           return { ready: false };
         }
-        try {
-          const dataUrl = canvas.toDataURL("image/png");
-          if (!dataUrl || !dataUrl.startsWith("data:image/png;base64,")) {
-            return { ready: false };
-          }
-          const mid = Math.floor(dataUrl.length / 2);
-          const sig = `${dataUrl.length}:${dataUrl.slice(mid, mid + 48)}:${dataUrl.slice(-48)}`;
-          return { ready: true, dataUrl, sig };
-        } catch {
-          return { ready: false };
-        }
+        const sig = `${canvas.width}x${canvas.height}`;
+        return { ready: true, sig };
       }
     });
 
     const snapshot = results?.[0]?.result;
-    if (snapshot?.ready && snapshot.sig && snapshot.dataUrl) {
+    if (snapshot?.ready && snapshot.sig) {
       if (snapshot.sig === lastSig) {
         stableCount += 1;
       } else {
@@ -278,7 +383,7 @@ async function waitForStableCanvas(tabId) {
         stableCount = 1;
       }
       if (stableCount >= stableNeeded) {
-        return { dataUrl: snapshot.dataUrl };
+        return {};
       }
     } else {
       lastSig = null;
