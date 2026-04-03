@@ -68,8 +68,8 @@ async function runExport(format) {
       }
 
       items.push({
-        name: `${String(page).padStart(4, "0")}.png`,
-        ext: "png",
+        name: `${String(page).padStart(4, "0")}.${shot.ext}`,
+        ext: shot.ext,
         buffer: dataUrlToArrayBuffer(shot.dataUrl)
       });
 
@@ -187,7 +187,9 @@ async function saveEpub(items, fileBaseName, title) {
   for (let i = 0; i < items.length; i += 1) {
     const n = i + 1;
     const id = String(n).padStart(4, "0");
-    const imgRel = `images/${id}.png`;
+    const imgExt = items[i].ext === "jpg" ? "jpg" : "png";
+    const imgMime = imgExt === "jpg" ? "image/jpeg" : "image/png";
+    const imgRel = `images/${id}.${imgExt}`;
     const chapRel = `chap${id}.xhtml`;
     zipFiles[`OEBPS/${imgRel}`] = new Uint8Array(items[i].buffer);
     const xhtml = `<?xml version="1.0" encoding="UTF-8"?>
@@ -199,7 +201,7 @@ async function saveEpub(items, fileBaseName, title) {
 </body>
 </html>`;
     zipFiles[`OEBPS/${chapRel}`] = encoder.encode(xhtml);
-    manifestLines.push(`    <item id="img${id}" href="${imgRel}" media-type="image/png"/>`);
+    manifestLines.push(`    <item id="img${id}" href="${imgRel}" media-type="${imgMime}"/>`);
     manifestLines.push(`    <item id="chap${id}" href="${chapRel}" media-type="application/xhtml+xml"/>`);
     spineLines.push(`    <itemref idref="chap${id}"/>`);
     navPoints.push(
@@ -348,11 +350,12 @@ async function captureArchivePageImage(tabId) {
     MAX_CANVAS_EXPORT_SIDE
   );
 
-  if (!dataUrl || !dataUrl.startsWith("data:image/png;base64,")) {
+  if (!dataUrl || (!dataUrl.startsWith("data:image/png;base64,") && !dataUrl.startsWith("data:image/jpeg;base64,"))) {
     throw new Error("Не удалось получить изображение страницы (.konvajs-content).");
   }
 
-  return { dataUrl };
+  const ext = dataUrl.startsWith("data:image/jpeg") ? "jpg" : "png";
+  return { dataUrl, ext };
 }
 
 async function exportKonvaOrCanvasSnapshot(tabId, pixelRatio, maxCanvasSide) {
@@ -360,7 +363,7 @@ async function exportKonvaOrCanvasSnapshot(tabId, pixelRatio, maxCanvasSide) {
     target: { tabId },
     world: "MAIN",
     args: [pixelRatio, maxCanvasSide],
-    func: (pr, maxSide) => {
+    func: async (pr, maxSide) => {
       const root = document.querySelector(".konvajs-content");
       if (!root) {
         return null;
@@ -412,7 +415,35 @@ async function exportKonvaOrCanvasSnapshot(tabId, pixelRatio, maxCanvasSide) {
               } catch {
                 /* ignore */
               }
-              // Попытка 1: прямое рисование исходника на offscreen canvas — нативное разрешение
+              // Попытка 1: прямой fetch исходника — максимальное качество, оригинальные байты без canvas
+              if (largestImg && largestImg.src && /^https?:\/\//.test(largestImg.src)) {
+                try {
+                  const resp = await fetch(largestImg.src, { credentials: "include" });
+                  if (resp.ok) {
+                    const ct = resp.headers.get("content-type") || "";
+                    if (ct.includes("jpeg") || ct.includes("jpg") || ct.includes("png")) {
+                      const blob = await resp.blob();
+                      const dataUrl = await new Promise((resolve, reject) => {
+                        const reader = new FileReader();
+                        reader.onload = () => resolve(reader.result);
+                        reader.onerror = reject;
+                        reader.readAsDataURL(blob);
+                      });
+                      if (
+                        dataUrl &&
+                        (dataUrl.startsWith("data:image/jpeg") ||
+                          dataUrl.startsWith("data:image/png"))
+                      ) {
+                        return dataUrl;
+                      }
+                    }
+                  }
+                } catch {
+                  /* fetch недоступен — переходим к canvas */
+                }
+              }
+
+              // Попытка 2: прямое рисование исходника на offscreen canvas — нативное разрешение
               if (largestImg && largestImg.naturalWidth > 0 && largestImg.naturalHeight > 0) {
                 let nw = largestImg.naturalWidth;
                 let nh = largestImg.naturalHeight;
@@ -436,7 +467,7 @@ async function exportKonvaOrCanvasSnapshot(tabId, pixelRatio, maxCanvasSide) {
                 }
               }
 
-              // Попытка 2: Konva toDataURL с pixelRatio, привязанным к разрешению исходника
+              // Попытка 3: Konva toDataURL с pixelRatio, привязанным к разрешению исходника
               const cap = Math.min(
                 pr,
                 Math.floor(maxSide / sw),
