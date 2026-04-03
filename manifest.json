@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Yandex Archive Downloader",
-  "version": "0.1.0",
-  "description": "Скачивает страницы документа Яндекс.Архив в ZIP или PDF.",
+  "version": "0.2.0",
+  "description": "Скачивает страницы документа Яндекс.Архив в PDF в оригинальном разрешении.",
   "permissions": ["activeTab", "downloads", "storage", "tabs", "scripting"],
   "host_permissions": ["https://yandex.ru/*"],
   "background": {
@@ -14,7 +14,7 @@
   },
   "web_accessible_resources": [
     {
-      "resources": ["lib/fflate.min.js", "lib/pdf-lib.min.js"],
+      "resources": ["lib/pdf-lib.min.js"],
       "matches": ["<all_urls>"]
     }
   ]

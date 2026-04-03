@@ -1,17 +1,11 @@
 const startButton = document.getElementById("start");
 const stopButton = document.getElementById("stop");
-const formatSelect = document.getElementById("format");
 const progressEl = document.getElementById("progress");
 
 startButton.addEventListener("click", async () => {
   setMessage("Запуск...");
-  const format = formatSelect.value;
 
-  const response = await chrome.runtime.sendMessage({
-    type: "START_EXPORT",
-    format
-  });
-
+  const response = await chrome.runtime.sendMessage({ type: "START_EXPORT" });
   if (!response?.ok) {
     setMessage(`Ошибка: ${response?.error || "неизвестная ошибка"}`);
   }
@@ -32,7 +26,6 @@ chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== "session" || !changes.exportProgress) {
     return;
   }
-
   renderProgress(changes.exportProgress.newValue);
 });
 
@@ -42,13 +35,14 @@ function renderProgress(progress) {
   }
 
   const { phase, current, total, done, partial, noData } = progress;
+
   if (done) {
     if (noData) {
       setMessage("Нет страниц для сохранения.");
     } else if (partial) {
       setMessage("Частичная выгрузка сохранена (_partial).");
     } else {
-      setMessage("Готово. Файл сохранен через диалог загрузки.");
+      setMessage("Готово. Файл сохранён через диалог загрузки.");
     }
     return;
   }
