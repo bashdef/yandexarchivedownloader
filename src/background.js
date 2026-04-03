@@ -43,14 +43,18 @@ async function runExport(format) {
     const items = [];
     for (let page = 1; page <= meta.totalPages; page += 1) {
       if (STATE.cancelled) {
-        throw new Error("Экспорт остановлен пользователем.");
+        break;
       }
 
       const pageUrl = `${meta.baseUrl}/${page}`;
       await chrome.tabs.update(tab.id, { url: pageUrl });
-      await waitForTabLoad(tab.id);
+      await waitForTabLoad(tab.id, pageUrl);
 
-      const shot = await captureCanvas(tab.id);
+      const shot = await waitForStableCanvas(tab.id);
+      if (shot.cancelled) {
+        break;
+      }
+
       items.push({
         name: `${String(page).padStart(4, "0")}.png`,
         ext: "png",
@@ -65,15 +69,36 @@ async function runExport(format) {
       });
     }
 
+    if (items.length === 0) {
+      await setProgress({
+        phase: STATE.cancelled ? "Остановлено" : "Ошибка",
+        current: 0,
+        total: meta.totalPages,
+        done: true,
+        partial: false,
+        noData: true
+      });
+      return;
+    }
+
+    const partial = items.length < meta.totalPages;
+    const rawTitle = meta.title || meta.documentId || "archive-document";
+    const fileBaseName = `${sanitizeFileName(rawTitle)}${partial ? "_partial" : ""}`;
+
     await setProgress({ phase: "Сборка файла", current: items.length, total: items.length, done: false });
-    const fileBaseName = sanitizeFileName(meta.title || meta.documentId || "archive-document");
     if (format === "zip") {
       await saveZip(items, fileBaseName);
     } else {
       await savePdf(items, fileBaseName);
     }
 
-    await setProgress({ phase: "Готово", current: items.length, total: items.length, done: true });
+    await setProgress({
+      phase: partial ? "Готово (частично)" : "Готово",
+      current: items.length,
+      total: meta.totalPages,
+      done: true,
+      partial
+    });
   } finally {
     STATE.running = false;
     STATE.cancelled = false;
@@ -157,30 +182,67 @@ async function readDocumentMeta(tabId, tabUrl) {
   return meta;
 }
 
-async function captureCanvas(tabId) {
-  const result = await chrome.scripting.executeScript({
-    target: { tabId },
-    func: async () => {
-      const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-      for (let i = 0; i < 30; i += 1) {
-        const canvas = document.querySelector(".konvajs-content canvas");
-        if (canvas && canvas.width > 0 && canvas.height > 0) {
-          const dataUrl = canvas.toDataURL("image/png");
-          if (dataUrl && dataUrl.startsWith("data:image/png;base64,")) {
-            return { dataUrl };
-          }
-        }
-        await wait(250);
-      }
-      throw new Error("Не найден canvas в .konvajs-content.");
-    }
-  });
+async function waitForStableCanvas(tabId) {
+  const maxMs = 120000;
+  const stableNeeded = 3;
+  const intervalMs = 450;
+  const start = Date.now();
+  let lastSig = null;
+  let stableCount = 0;
 
-  const shot = result?.[0]?.result;
-  if (!shot?.dataUrl) {
-    throw new Error("Не удалось получить изображение страницы.");
+  while (Date.now() - start < maxMs) {
+    if (STATE.cancelled) {
+      return { cancelled: true };
+    }
+
+    const results = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => {
+        if (document.readyState !== "complete") {
+          return { ready: false };
+        }
+        const root = document.querySelector(".konvajs-content");
+        if (!root) {
+          return { ready: false };
+        }
+        const canvas = root.querySelector("canvas");
+        if (!canvas || canvas.width < 64 || canvas.height < 64) {
+          return { ready: false };
+        }
+        try {
+          const dataUrl = canvas.toDataURL("image/png");
+          if (!dataUrl || !dataUrl.startsWith("data:image/png;base64,")) {
+            return { ready: false };
+          }
+          const mid = Math.floor(dataUrl.length / 2);
+          const sig = `${dataUrl.length}:${dataUrl.slice(mid, mid + 48)}:${dataUrl.slice(-48)}`;
+          return { ready: true, dataUrl, sig };
+        } catch {
+          return { ready: false };
+        }
+      }
+    });
+
+    const snapshot = results?.[0]?.result;
+    if (snapshot?.ready && snapshot.sig && snapshot.dataUrl) {
+      if (snapshot.sig === lastSig) {
+        stableCount += 1;
+      } else {
+        lastSig = snapshot.sig;
+        stableCount = 1;
+      }
+      if (stableCount >= stableNeeded) {
+        return { dataUrl: snapshot.dataUrl };
+      }
+    } else {
+      lastSig = null;
+      stableCount = 0;
+    }
+
+    await sleep(intervalMs);
   }
-  return shot;
+
+  throw new Error("Таймаут ожидания загрузки изображения (.konvajs-content).");
 }
 
 function dataUrlToArrayBuffer(dataUrl) {
@@ -211,22 +273,67 @@ function sanitizeFileName(value) {
   return cleaned || "archive-document";
 }
 
-function waitForTabLoad(tabId) {
-  return new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => {
-      chrome.tabs.onUpdated.removeListener(listener);
-      reject(new Error("Таймаут загрузки страницы."));
-    }, 30000);
+function waitForTabLoad(tabId, expectedPageUrl) {
+  let expectedPath = null;
+  try {
+    expectedPath = expectedPageUrl ? new URL(expectedPageUrl).pathname : null;
+  } catch {
+    expectedPath = null;
+  }
 
-    function listener(updatedTabId, info) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const maxMs = 90000;
+
+    const finish = (ok) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      chrome.tabs.onUpdated.removeListener(listener);
+      if (ok) {
+        resolve();
+      } else {
+        reject(new Error("Таймаут загрузки страницы."));
+      }
+    };
+
+    const timeout = setTimeout(() => finish(false), maxMs);
+
+    function listener(updatedTabId, info, tab) {
       if (updatedTabId !== tabId || info.status !== "complete") {
         return;
       }
-      clearTimeout(timeout);
-      chrome.tabs.onUpdated.removeListener(listener);
-      resolve();
+      if (expectedPath && tab?.url) {
+        try {
+          if (new URL(tab.url).pathname !== expectedPath) {
+            return;
+          }
+        } catch {
+          return;
+        }
+      }
+      finish(true);
     }
 
     chrome.tabs.onUpdated.addListener(listener);
+    chrome.tabs.get(tabId).then((t) => {
+      if (t?.status !== "complete" || !t.url) {
+        return;
+      }
+      if (expectedPath) {
+        try {
+          if (new URL(t.url).pathname !== expectedPath) {
+            return;
+          }
+        } catch {
+          return;
+        }
+      }
+      finish(true);
+    });
   });
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }

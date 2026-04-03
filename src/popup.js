@@ -41,9 +41,15 @@ function renderProgress(progress) {
     return;
   }
 
-  const { phase, current, total, done } = progress;
+  const { phase, current, total, done, partial, noData } = progress;
   if (done) {
-    setMessage("Готово. Файл сохранен через диалог загрузки.");
+    if (noData) {
+      setMessage("Нет страниц для сохранения.");
+    } else if (partial) {
+      setMessage("Частичная выгрузка сохранена (_partial).");
+    } else {
+      setMessage("Готово. Файл сохранен через диалог загрузки.");
+    }
     return;
   }
 
