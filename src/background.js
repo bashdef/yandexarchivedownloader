@@ -4,6 +4,9 @@ importScripts("../lib/pdf-lib.min.js");
 
 const STATE = { running: false, cancelled: false };
 
+const RETRY_ATTEMPTS = 3;
+const RETRY_DELAY_MS = 2000;
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === "START_EXPORT") {
     runExport()
@@ -33,24 +36,50 @@ async function runExport() {
       throw new Error("Не удалось определить активную вкладку.");
     }
     if (!/^https:\/\/yandex\.ru\/archive\/catalog\/[^/]+\/\d+/.test(tab.url)) {
-      throw new Error("Откройте страницу документа Яндекс.Архив (URL должен содержать номер страницы).");
+      throw new Error(
+        "Откройте страницу документа Яндекс.Архив (URL должен содержать номер страницы)."
+      );
     }
 
+    // Единственный вызов executeScript — читаем мета из __NEXT_DATA__.
+    // После этого вкладку можно закрыть или перейти на другую страницу.
     const meta = await readMeta(tab.id);
-    await setProgress({ phase: "Загрузка страниц", current: 0, total: meta.totalPages, done: false });
+
+    await setProgress({
+      phase: "Загрузка страниц",
+      current: 0,
+      total: meta.totalPages,
+      done: false,
+    });
 
     const images = [];
+    let consecutiveFails = 0;
+
     for (let page = 1; page <= meta.totalPages; page += 1) {
       if (STATE.cancelled) {
         break;
       }
 
-      const img = await fetchPageImage(tab.id, meta.buildId, meta.parentNodeId, page);
+      // Retry-логика: до RETRY_ATTEMPTS попыток на страницу
+      const img = await fetchWithRetry(
+        () => fetchPageImage(meta.buildId, meta.parentNodeId, page),
+        RETRY_ATTEMPTS,
+        RETRY_DELAY_MS
+      );
+
       if (!img) {
-        break;
+        consecutiveFails += 1;
+        // После 3 подряд ошибок прекращаем — скорее всего страниц больше нет
+        if (consecutiveFails >= 3) {
+          break;
+        }
+        // Одиночный сбой — пропускаем страницу, продолжаем
+        continue;
       }
 
+      consecutiveFails = 0;
       images.push(img);
+
       await setProgress({
         phase: "Загрузка страниц",
         current: page,
@@ -96,7 +125,8 @@ async function runExport() {
 }
 
 /**
- * Читает метаданные из __NEXT_DATA__ на текущей странице документа.
+ * Читает buildId, parentNodeId, totalPages из __NEXT_DATA__ на странице.
+ * Единственное место где нужна вкладка — только в начале.
  */
 async function readMeta(tabId) {
   const results = await chrome.scripting.executeScript({
@@ -129,76 +159,76 @@ async function readMeta(tabId) {
 }
 
 /**
- * Для страницы page:
- *  1. Получает node_id через Next.js data API.
- *  2. Скачивает оригинальное изображение (/api/image?type=original).
- *  3. Возвращает { dataUrl, ext, width, height } или null при ошибке.
+ * Загружает одну страницу:
+ *  1. Получает node_id через Next.js data API (запрос из background, с cookies).
+ *  2. Скачивает оригинальное изображение через /archive/api/image?type=original.
  *
- * Всё выполняется в контексте вкладки (с cookies пользователя).
+ * Всё выполняется из background service worker — вкладка не нужна.
+ * MV3 service worker автоматически включает cookies для доменов из host_permissions.
  */
-async function fetchPageImage(tabId, buildId, parentNodeId, page) {
-  const results = await chrome.scripting.executeScript({
-    target: { tabId },
-    args: [buildId, parentNodeId, page],
-    func: async (buildId, parentNodeId, page) => {
-      try {
-        // Шаг 1: получаем node_id страницы через Next.js data endpoint
-        const metaUrl =
-          `/archive/_next/data/${buildId}/catalog/${parentNodeId}/${page}.json` +
-          `?parentNodeId=${parentNodeId}&docNumber=${page}`;
-        const metaResp = await fetch(metaUrl, { credentials: "include" });
-        if (!metaResp.ok) return null;
+async function fetchPageImage(buildId, parentNodeId, page) {
+  // Шаг 1: получаем node_id страницы
+  const metaUrl =
+    `https://yandex.ru/archive/_next/data/${buildId}/catalog/${parentNodeId}/${page}.json` +
+    `?parentNodeId=${parentNodeId}&docNumber=${page}`;
 
-        const metaJson = await metaResp.json();
-        const node = metaJson?.pageProps?.currentNode;
-        if (!node?.id) return null;
+  const metaResp = await fetch(metaUrl, { credentials: "include" });
+  if (!metaResp.ok) return null;
 
-        // Шаг 2: скачиваем оригинальное изображение
-        const imgUrl = `/archive/api/image?id=${node.id}&type=original`;
-        const imgResp = await fetch(imgUrl, { credentials: "include" });
-        if (!imgResp.ok) return null;
+  const metaJson = await metaResp.json();
+  const node = metaJson?.pageProps?.currentNode;
+  if (!node?.id) return null;
 
-        const blob = await imgResp.blob();
-        const ext =
-          blob.type.includes("jpeg") || blob.type.includes("jpg") ? "jpg" : "png";
+  // Шаг 2: скачиваем оригинальное изображение
+  const imgUrl = `https://yandex.ru/archive/api/image?id=${node.id}&type=original`;
+  const imgResp = await fetch(imgUrl, { credentials: "include" });
+  if (!imgResp.ok) return null;
 
-        // Шаг 3: конвертируем в base64 data URL
-        const dataUrl = await new Promise((resolve, reject) => {
-          const reader = new FileReader();
-          reader.onload = () => resolve(reader.result);
-          reader.onerror = reject;
-          reader.readAsDataURL(blob);
-        });
+  const contentType = imgResp.headers.get("content-type") || "";
+  const ext = contentType.includes("jpeg") || contentType.includes("jpg") ? "jpg" : "png";
+  const bytes = new Uint8Array(await imgResp.arrayBuffer());
 
-        return {
-          ext,
-          dataUrl,
-          width: node.originalImageSize?.width || 0,
-          height: node.originalImageSize?.height || 0,
-        };
-      } catch {
-        return null;
-      }
-    },
-  });
-
-  return results?.[0]?.result || null;
+  return {
+    bytes,
+    ext,
+    width: node.originalImageSize?.width || 0,
+    height: node.originalImageSize?.height || 0,
+  };
 }
 
 /**
- * Собирает PDF из массива изображений и скачивает.
- * Страница PDF = размер оригинального изображения (максимальное качество при зуме).
+ * Повторяет fn до maxAttempts раз с задержкой delayMs между попытками.
+ * Возвращает результат первой успешной попытки или null.
+ */
+async function fetchWithRetry(fn, maxAttempts, delayMs) {
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    if (STATE.cancelled) return null;
+    try {
+      const result = await fn();
+      if (result !== null && result !== undefined) return result;
+    } catch {
+      /* пробуем ещё */
+    }
+    if (attempt < maxAttempts) {
+      await sleep(delayMs);
+    }
+  }
+  return null;
+}
+
+/**
+ * Собирает PDF из массива изображений.
+ * Страница PDF = размер оригинала (пиксели как точки) → полное качество при зуме.
  */
 async function savePdf(images, fileBaseName) {
   const { PDFDocument } = PDFLib;
   const pdfDoc = await PDFDocument.create();
 
   for (const img of images) {
-    const bytes = dataUrlToBytes(img.dataUrl);
     const embedded =
       img.ext === "jpg"
-        ? await pdfDoc.embedJpg(bytes)
-        : await pdfDoc.embedPng(bytes);
+        ? await pdfDoc.embedJpg(img.bytes)
+        : await pdfDoc.embedPng(img.bytes);
 
     const { width, height } = embedded.scale(1);
     const page = pdfDoc.addPage([width, height]);
@@ -224,16 +254,6 @@ async function setProgress(progress) {
   await chrome.storage.session.set({ exportProgress: progress });
 }
 
-function dataUrlToBytes(dataUrl) {
-  const base64 = dataUrl.split(",")[1] || "";
-  const binary = atob(base64);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i += 1) {
-    bytes[i] = binary.charCodeAt(i);
-  }
-  return bytes;
-}
-
 function bytesToDataUrl(bytes, mimeType) {
   const chunkSize = 0x8000;
   let binary = "";
@@ -250,4 +270,8 @@ function sanitizeFileName(value) {
       .replace(/\s+/g, " ")
       .trim() || "archive-document"
   );
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
