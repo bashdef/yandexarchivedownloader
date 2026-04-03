@@ -412,6 +412,31 @@ async function exportKonvaOrCanvasSnapshot(tabId, pixelRatio, maxCanvasSide) {
               } catch {
                 /* ignore */
               }
+              // Попытка 1: прямое рисование исходника на offscreen canvas — нативное разрешение
+              if (largestImg && largestImg.naturalWidth > 0 && largestImg.naturalHeight > 0) {
+                let nw = largestImg.naturalWidth;
+                let nh = largestImg.naturalHeight;
+                if (nw > maxSide || nh > maxSide) {
+                  const scale = Math.min(maxSide / nw, maxSide / nh);
+                  nw = Math.floor(nw * scale);
+                  nh = Math.floor(nh * scale);
+                }
+                try {
+                  const offscreen = document.createElement("canvas");
+                  offscreen.width = nw;
+                  offscreen.height = nh;
+                  const ctx = offscreen.getContext("2d");
+                  ctx.drawImage(largestImg, 0, 0, nw, nh);
+                  const url = offscreen.toDataURL("image/png");
+                  if (url && url.startsWith("data:image/png")) {
+                    return url;
+                  }
+                } catch {
+                  /* CORS tainted canvas — переходим к рендеру через Konva */
+                }
+              }
+
+              // Попытка 2: Konva toDataURL с pixelRatio, привязанным к разрешению исходника
               const cap = Math.min(
                 pr,
                 Math.floor(maxSide / sw),
@@ -420,22 +445,24 @@ async function exportKonvaOrCanvasSnapshot(tabId, pixelRatio, maxCanvasSide) {
               const prSafe = Math.max(1, cap);
               let url = null;
               if (typeof stage.toDataURL === "function") {
-                try {
-                  if (
-                    largestImg &&
-                    largestImg.naturalWidth <= maxSide &&
-                    largestImg.naturalHeight <= maxSide
-                  ) {
-                    url = stage.toDataURL({
-                      mimeType: "image/png",
-                      pixelRatio: 1,
-                      width: largestImg.naturalWidth,
-                      height: largestImg.naturalHeight
-                    });
+                if (largestImg && largestImg.naturalWidth > 0 && sw > 0 && sh > 0) {
+                  const idealRatio = Math.min(
+                    largestImg.naturalWidth / sw,
+                    largestImg.naturalHeight / sh
+                  );
+                  const nativeCap = Math.min(
+                    idealRatio,
+                    Math.floor(maxSide / sw),
+                    Math.floor(maxSide / sh)
+                  );
+                  const prNative = Math.max(1, nativeCap);
+                  try {
+                    url = stage.toDataURL({ mimeType: "image/png", pixelRatio: prNative });
+                  } catch {
+                    url = null;
                   }
-                } catch {
-                  url = null;
                 }
+                // Попытка 3: fallback с prSafe (лимит холста Chrome)
                 if (!url || !url.startsWith("data:image/png")) {
                   url = stage.toDataURL({ mimeType: "image/png", pixelRatio: prSafe });
                 }
