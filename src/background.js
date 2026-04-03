@@ -100,6 +100,8 @@ async function runExport(format) {
     await setProgress({ phase: "Сборка файла", current: items.length, total: items.length, done: false });
     if (format === "zip") {
       await saveZip(items, fileBaseName);
+    } else if (format === "epub") {
+      await saveEpub(items, fileBaseName, rawTitle);
     } else {
       await savePdf(items, fileBaseName);
     }
@@ -155,6 +157,105 @@ async function savePdf(items, fileBaseName) {
     saveAs: true
   });
 
+}
+
+async function saveEpub(items, fileBaseName, title) {
+  const encoder = new TextEncoder();
+  const escXml = (s) =>
+    String(s || "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&apos;");
+  const safeTitle = escXml(title || fileBaseName || "Document");
+  const uid = epubRandomUuid();
+
+  const zipFiles = {
+    mimetype: encoder.encode("application/epub+zip"),
+    "META-INF/container.xml": encoder.encode(`<?xml version="1.0" encoding="UTF-8"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles><rootfile full-path="OEBPS/package.opf" media-type="application/oebps-package+xml"/></rootfiles>
+</container>`)
+  };
+
+  const manifestLines = [
+    '    <item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>'
+  ];
+  const spineLines = [];
+  const navPoints = [];
+
+  for (let i = 0; i < items.length; i += 1) {
+    const n = i + 1;
+    const id = String(n).padStart(4, "0");
+    const imgRel = `images/${id}.png`;
+    const chapRel = `chap${id}.xhtml`;
+    zipFiles[`OEBPS/${imgRel}`] = new Uint8Array(items[i].buffer);
+    const xhtml = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="ru">
+<head><meta charset="UTF-8"/><title>${escXml(`Стр. ${n}`)}</title></head>
+<body style="margin:0;padding:0;text-align:center;background:#000;">
+<img src="${imgRel}" alt="" style="width:100%;height:auto;max-width:100%;"/>
+</body>
+</html>`;
+    zipFiles[`OEBPS/${chapRel}`] = encoder.encode(xhtml);
+    manifestLines.push(`    <item id="img${id}" href="${imgRel}" media-type="image/png"/>`);
+    manifestLines.push(`    <item id="chap${id}" href="${chapRel}" media-type="application/xhtml+xml"/>`);
+    spineLines.push(`    <itemref idref="chap${id}"/>`);
+    navPoints.push(
+      `    <navPoint id="np${id}" playOrder="${n}"><navLabel><text>Стр. ${n}</text></navLabel><content src="${chapRel}"/></navPoint>`
+    );
+  }
+
+  const packageOpf = `<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" unique-identifier="bookid" version="2.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:title>${safeTitle}</dc:title>
+    <dc:identifier id="bookid">urn:uuid:${uid}</dc:identifier>
+    <dc:language>ru</dc:language>
+  </metadata>
+  <manifest>
+${manifestLines.join("\n")}
+  </manifest>
+  <spine toc="ncx">
+${spineLines.join("\n")}
+  </spine>
+</package>`;
+
+  const tocNcx = `<?xml version="1.0" encoding="UTF-8"?>
+<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">
+  <head>
+    <meta name="dtb:uid" content="urn:uuid:${uid}"/>
+    <meta name="dtb:depth" content="1"/>
+  </head>
+  <docTitle><text>${safeTitle}</text></docTitle>
+  <navMap>
+${navPoints.join("\n")}
+  </navMap>
+</ncx>`;
+
+  zipFiles["OEBPS/package.opf"] = encoder.encode(packageOpf);
+  zipFiles["OEBPS/toc.ncx"] = encoder.encode(tocNcx);
+
+  const zipped = fflate.zipSync(zipFiles, { level: 0 });
+  const url = bytesToDataUrl(zipped, "application/epub+zip");
+
+  await chrome.downloads.download({
+    url,
+    filename: `${fileBaseName || "archive-document"}.epub`,
+    saveAs: true
+  });
+}
+
+function epubRandomUuid() {
+  try {
+    if (typeof crypto !== "undefined" && crypto.randomUUID) {
+      return crypto.randomUUID();
+    }
+  } catch {
+    /* ignore */
+  }
+  return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
 async function getActiveTab() {
@@ -276,22 +377,69 @@ async function exportKonvaOrCanvasSnapshot(tabId, pixelRatio, maxCanvasSide) {
           try {
             const container = stage.container && stage.container();
             if (container && root.contains(container)) {
-              const w = Math.max(
+              let sw = Math.max(
                 1,
                 typeof stage.width === "function" ? stage.width() : stage.attrs?.width || 1
               );
-              const h = Math.max(
+              let sh = Math.max(
                 1,
                 typeof stage.height === "function" ? stage.height() : stage.attrs?.height || 1
               );
-              const prSafe = Math.max(
-                1,
-                Math.min(pr, Math.floor(maxSide / w), Math.floor(maxSide / h))
+              let largestImg = null;
+              let largestArea = 0;
+              try {
+                if (typeof stage.find === "function") {
+                  const imgNodes = stage.find("Image");
+                  if (imgNodes && imgNodes.length) {
+                    for (const node of imgNodes) {
+                      const rect =
+                        node.getClientRect && node.getClientRect({ skipShadow: true });
+                      if (rect && rect.width > 0 && rect.height > 0) {
+                        sw = Math.max(sw, rect.width);
+                        sh = Math.max(sh, rect.height);
+                      }
+                      const domImg = node.image && node.image();
+                      if (domImg && domImg.naturalWidth > 0 && domImg.naturalHeight > 0) {
+                        const area = domImg.naturalWidth * domImg.naturalHeight;
+                        if (area > largestArea) {
+                          largestArea = area;
+                          largestImg = domImg;
+                        }
+                      }
+                    }
+                  }
+                }
+              } catch {
+                /* ignore */
+              }
+              const cap = Math.min(
+                pr,
+                Math.floor(maxSide / sw),
+                Math.floor(maxSide / sh)
               );
-              const url =
-                typeof stage.toDataURL === "function"
-                  ? stage.toDataURL({ mimeType: "image/png", pixelRatio: prSafe })
-                  : null;
+              const prSafe = Math.max(1, cap);
+              let url = null;
+              if (typeof stage.toDataURL === "function") {
+                try {
+                  if (
+                    largestImg &&
+                    largestImg.naturalWidth <= maxSide &&
+                    largestImg.naturalHeight <= maxSide
+                  ) {
+                    url = stage.toDataURL({
+                      mimeType: "image/png",
+                      pixelRatio: 1,
+                      width: largestImg.naturalWidth,
+                      height: largestImg.naturalHeight
+                    });
+                  }
+                } catch {
+                  url = null;
+                }
+                if (!url || !url.startsWith("data:image/png")) {
+                  url = stage.toDataURL({ mimeType: "image/png", pixelRatio: prSafe });
+                }
+              }
               if (url && url.startsWith("data:image/png")) {
                 return url;
               }
