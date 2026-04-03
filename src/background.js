@@ -4,10 +4,12 @@ importScripts("../lib/fflate.min.js", "../lib/pdf-lib.min.js");
 
 const STATE = { running: false, cancelled: false };
 
-/** Больше pixelRatio = больше пикселей в PNG/PDF и чётче при зуме в просмотрщике (файлы тяжелее). */
-const EXPORT_PIXEL_RATIO = 2;
-/** Если Konva недоступен — временно увеличить масштаб вкладки, чтобы канвас отрисовался крупнее. */
-const TAB_ZOOM_BOOST = 1.75;
+/**
+ * Запрашиваемый pixelRatio для Konva toDataURL.
+ * Фактическое значение на странице ограничивается MAX_CANVAS_EXPORT_SIDE (лимит canvas в Chrome).
+ */
+const EXPORT_PIXEL_RATIO = 64;
+const MAX_CANVAS_EXPORT_SIDE = 16384;
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === "START_EXPORT") {
@@ -239,14 +241,11 @@ async function captureArchivePageImage(tabId) {
     return { cancelled: true };
   }
 
-  let dataUrl = await exportKonvaOrCanvasSnapshot(tabId, EXPORT_PIXEL_RATIO);
-  if (!dataUrl) {
-    const boosted = await exportWithBrowserZoomBoost(tabId);
-    if (boosted?.cancelled) {
-      return { cancelled: true };
-    }
-    dataUrl = boosted;
-  }
+  const dataUrl = await exportKonvaOrCanvasSnapshot(
+    tabId,
+    EXPORT_PIXEL_RATIO,
+    MAX_CANVAS_EXPORT_SIDE
+  );
 
   if (!dataUrl || !dataUrl.startsWith("data:image/png;base64,")) {
     throw new Error("Не удалось получить изображение страницы (.konvajs-content).");
@@ -255,47 +254,12 @@ async function captureArchivePageImage(tabId) {
   return { dataUrl };
 }
 
-async function exportWithBrowserZoomBoost(tabId) {
-  let prevZoom = 1;
-  try {
-    prevZoom = await chrome.tabs.getZoom(tabId);
-  } catch {
-    return null;
-  }
-
-  try {
-    await chrome.tabs.setZoom(tabId, TAB_ZOOM_BOOST);
-    await sleep(800);
-    const stableAgain = await waitForStableCanvas(tabId);
-    if (stableAgain.cancelled) {
-      await chrome.tabs.setZoom(tabId, prevZoom);
-      return { cancelled: true };
-    }
-  } catch {
-    try {
-      await chrome.tabs.setZoom(tabId, prevZoom);
-    } catch {
-      /* ignore */
-    }
-    return null;
-  }
-
-  let dataUrl = await exportKonvaOrCanvasSnapshot(tabId, 1);
-  try {
-    await chrome.tabs.setZoom(tabId, prevZoom);
-  } catch {
-    /* ignore */
-  }
-
-  return dataUrl;
-}
-
-async function exportKonvaOrCanvasSnapshot(tabId, pixelRatio) {
+async function exportKonvaOrCanvasSnapshot(tabId, pixelRatio, maxCanvasSide) {
   const results = await chrome.scripting.executeScript({
     target: { tabId },
     world: "MAIN",
-    args: [pixelRatio],
-    func: (pr) => {
+    args: [pixelRatio, maxCanvasSide],
+    func: (pr, maxSide) => {
       const root = document.querySelector(".konvajs-content");
       if (!root) {
         return null;
@@ -312,9 +276,21 @@ async function exportKonvaOrCanvasSnapshot(tabId, pixelRatio) {
           try {
             const container = stage.container && stage.container();
             if (container && root.contains(container)) {
+              const w = Math.max(
+                1,
+                typeof stage.width === "function" ? stage.width() : stage.attrs?.width || 1
+              );
+              const h = Math.max(
+                1,
+                typeof stage.height === "function" ? stage.height() : stage.attrs?.height || 1
+              );
+              const prSafe = Math.max(
+                1,
+                Math.min(pr, Math.floor(maxSide / w), Math.floor(maxSide / h))
+              );
               const url =
                 typeof stage.toDataURL === "function"
-                  ? stage.toDataURL({ mimeType: "image/png", pixelRatio: pr })
+                  ? stage.toDataURL({ mimeType: "image/png", pixelRatio: prSafe })
                   : null;
               if (url && url.startsWith("data:image/png")) {
                 return url;
